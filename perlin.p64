@@ -1,0 +1,798 @@
+picotron cartridge // www.picotron.net
+version 2
+
+:: gfx/
+:: map/
+:: sfx/
+:: main.lua
+--[[pod_format="raw",created="2026-01-22 15:33:40",modified="2026-02-06 23:40:19",revision=578]]
+version = "v1.5.0"
+
+resolution = 128
+
+gridsize = 2
+
+hdr = false
+
+include "ui.lua"
+
+i8Max = 0x7f
+i16Max = 0x7fff
+i32Max = 0x7fffffff
+shades = 7
+gradient = userdata("u8",1,1)
+noisew,noiseh = 0,0
+
+ram_size = 0
+file_size = 0
+
+octaves = 4
+octave = 1
+roughness = 0.5
+lacunarity = 2
+seed = 0
+maxV = 0
+
+format = "i16"
+preview_format = "i16"
+
+done = true
+
+function SetPalette()
+	local value = 0
+	local step = 0xff // shades
+	local steprgb = (step<<16)+(step<<8)+(step)
+	
+	gradient = userdata("u8",1,shades+1)
+	gradient:set(0,0,shades)
+	for i=1,shades do
+		value += steprgb
+		pal(i,value,2)
+		gradient:set(0,i,shades-i)
+	end
+	palt(0,false)
+	preview_button.label = "High Bitdepth Preview"
+end
+
+function ResetPalette()
+	gradient = userdata("u8",1,shades+1)
+	gradient:set(0,0,30,14,23,7,12,16,1)
+	pal(2)
+	palt(32,false)
+	preview_button.label = "Low Bitdepth Preview"
+end
+
+function TogglePalette()
+	if hdr then
+		shades = 7
+		ResetPalette()
+		hdr = false
+	else
+		shades = 63
+		SetPalette()
+		hdr = true
+	end
+	DrawNoise()
+end
+
+function DrawNoise()
+	local values = unpod(export):convert("f64")
+	
+	if format=="i8" then
+		values:div(i8Max,values)	
+	elseif format=="i16" then
+		values:div(i16Max,values)
+	elseif format=="i32" then
+		values:div(i32Max,values)
+	end
+	
+		
+	if hdr then
+		ivalues = ((values+1)/2)*shades
+		visualize = ivalues:convert("u8")
+		set_spr(0,visualize)
+	else
+		ivalues = ((values+1)/2)*shades
+		visualize = gradient:take(ivalues:convert("i32"))
+		set_spr(0,visualize)
+	end
+end
+
+
+
+function Generate()
+	if resolution <= gridsize*(lacunarity ^ octaves) then
+		info = "size too low for " .. octaves .. " octaves!"
+	elseif done then
+		done = false
+		seed = tonum(seed_text:get_text()[1]) or 0
+		info = string.format("%i x %i  %i:%i", resolution, resolution,ceil(resolution/128),ceil(128/resolution))
+		octave = 1
+		values = userdata("f64",resolution,resolution)
+		
+		create_process("process.lua",{resolution=resolution,grid=gridsize,seed=seed,octave=1})
+	end
+end
+
+function FBMStep(msg)
+	
+	local step = unpod(msg.returned)
+	values += step * (roughness ^ (octave-1))
+	
+	sorted = values:copy()
+	sorted:mutate("f64",sorted:width()*sorted:height())
+	sorted:sort(true)
+	maxV = max(abs(sorted[0]),sorted[#sorted-1])
+	
+	metadata = {format=format,
+					seed=seed,
+					gridsize=gridsize,
+					roughness=roughness,
+					octaves=octaves}
+	
+	if format=="i8" then
+		export = values:mul(i8Max/maxV)
+		export = pod(export:convert("i8"),0x13,metadata)
+		
+	elseif format=="i16" then
+		export = values:mul(i16Max/maxV)
+		export = pod(export:convert("i16"),0x13,metadata)
+	elseif format=="i32" then
+		export = values:mul(i32Max/maxV)
+		export = pod(export:convert("i32"),0x13,metadata)
+	else
+		export = values:mul(1/maxV)
+		export = pod(export,0x13,metadata)
+	end
+	
+	preview_format = format
+	
+	ram_size = #values * 8 / 1000
+	file_size = #export /1000
+	
+	DrawNoise()
+	
+	if(octave<octaves) then
+		octave += 1
+		local grid = gridsize*(lacunarity ^ octave)
+		local scalar = max(abs(values:min()),values:max())
+		create_process("process.lua",{resolution=resolution,grid=grid,seed=seed+octave,octave=octave})
+	else
+		done = true
+	end
+end
+
+on_event("noise_done",FBMStep)
+
+function Save()
+	chooser({intention="save_file_as",path="/desktop"},savefile)
+	
+end
+
+function savefile(msg)
+	local path = msg.filename
+	local splitpath = split(path,".")
+	
+	if (splitpath[#splitpath] != "pod") then
+		path ..= ".pod"
+	end
+	
+	store(path,export)
+end
+
+function _init()
+	seed_text:set_text({"1"})
+	--Generate()
+	ResetPalette()
+end
+
+function _update()
+	
+	gui:update_all()
+end
+
+function _draw()
+	cls(6)
+	--if octave < octaves then
+	--	FBMStep()
+	--end
+	gui:draw_all()
+end
+:: perlin.lua
+--[[pod_format="raw",created="2026-01-22 15:34:31",modified="2026-02-06 20:53:29",revision=106]]
+function perlin(arg)
+	local sizeX = arg.sizeX or arg.size or 64
+	local sizeY = arg.sizeY or sizeX
+	local scale = arg.scale
+	
+	local gridX = arg.gridx or arg.grid or sizeX//scale
+	local gridY = arg.gridy or arg.grid or sizeY//scale
+	
+	scale = scale or sizeX/gridX or 16
+	
+	local values = userdata("f64", sizeX, sizeY)
+	local vectors = {}
+	
+	local minV,maxV = 1,-1
+	
+	srand(arg.seed or 0)
+	
+	--Grid Vectors
+	for y=0,ceil(gridY) do
+		local row = {}
+		for x=0,ceil(gridX) do
+			local theta = rnd(1)
+			row[x] = vec(cos(theta),sin(theta))
+		end
+		vectors[y] = row
+	end
+	
+	--Iterate over pixels
+	for y=0,sizeY do
+		for x=0,sizeX do
+			x0 =  x//scale
+			x1 = flr((x//scale + 1)%gridX)
+			y0 =  y//scale
+			y1 = flr((y//scale + 1)%gridY)
+			
+			xoffset = (x%scale)/scale
+			yoffset = (y%scale)/scale
+			
+			v00 = vec((x%scale)+0.5,(y%scale)+0.5)/(-scale)
+			v01 = vec(1,0) + v00
+			v10 = vec(0,1) + v00
+			v11 = vec(1,1) + v00
+			
+			dot00 = v00:dot(vectors[y0][x0])
+			dot01 = v01:dot(vectors[y0][x1])
+			dot10 = v10:dot(vectors[y1][x0])
+			dot11 = v11:dot(vectors[y1][x1])
+			
+			lerpx0 = lerp(dot00,dot01,smoothstep(xoffset))
+			lerpx1 = lerp(dot10,dot11,smoothstep(xoffset))
+			
+			lerpy = lerp(lerpx0,lerpx1,smoothstep(yoffset))
+			maxV = max(maxV,lerpy)
+			maxV = max(maxV,abs(lerpy))
+			values:set(x,y,lerpy)
+		end
+	end
+	
+	return values,maxV
+end
+
+function lerp(from,to,value)
+	return (to * value) + from * (1-value)
+end
+function smoothstep(v)
+	return v * v * (3 - 2 * v)
+end
+
+:: process.lua
+--[[pod_format="raw",created="2026-02-04 20:12:43",modified="2026-02-04 21:32:44",revision=47]]
+include "perlin.lua"
+
+arguments = env()
+size = arguments.resolution
+grid = arguments.grid
+seed = arguments.seed
+octave = arguments.octave
+parent = arguments.parent_pid
+
+--font = 1
+--fontlight = 7
+--borders = 1
+
+--fieldlight = 29
+--fieldmed = 13
+--fielddark = 18
+
+window{width = 100,height=12,
+		x=106,y=123,
+		pausable=false,
+		title="Noise Step",
+		resizeable=false,
+		has_frame=true,
+		z=64}
+
+
+cls(29)
+print("Generating Octave " .. octave,3,3,1)
+
+values,maxV = perlin{seed=seed,
+					size=size,
+					grid=grid}
+							
+send_message(parent,{event="noise_done",returned=pod(values,0x33)})
+
+:: ui.lua
+--[[pod_format="raw",created="2026-01-26 22:16:16",modified="2026-02-06 20:42:10",revision=715]]
+margins = 2
+
+outlineb = "\^o1ff"
+
+font = 1
+fontlight = 7
+borders = 1
+
+fieldlight = 29
+fieldmed = 13
+fielddark = 18
+
+buttoncolors = {
+	fg = fontlight + (font<<8),
+	bg = fielddark + (fieldlight<<8),
+	border = borders + (fielddark<<8)
+}
+
+buttoncolorsalt = {
+	fg = font + (fontlight<<8),
+	bg = fieldlight + (fielddark<<8),
+	border = borders + (borders<<8)
+}
+
+window{
+	width = 320,min_width = 256,
+	height = 180,min_height = 128,
+	title = "Perlin Generator " .. version,
+	pausable = false,
+	background_updates = true,
+	resizeable = true
+}
+
+gui = create_gui()
+
+preview_pane = gui:attach{
+	x=0,y=0,
+	width_rel=0.6,height_rel=1,
+	draw = function(self)
+	end
+}
+
+tool_pane = gui:attach{
+	width_rel=0.4,height_rel=1,
+	justify="right",
+	
+	draw = function(self)
+		rrectfill(1,1,self.width-2,self.height-2,2,13)
+		rrect(1,1,self.width-2,self.height-2,2,borders)
+	end
+}
+
+
+
+--Seed--------------------------------------------------------------------------
+
+seed_label = tool_pane:attach{
+	x=margins*3,y=6,width=25,height = 11,
+	draw = function(self) print("Seed:",margins,3,font) end
+}
+seed_field = tool_pane:attach{
+	x=-margins*3,y=6,width_rel = 0.6,height = 13,
+	justify = "right",
+	draw = function(self)
+		rrectfill(0,0,self.width,self.height,2,fieldlight)
+		rrect(0,0,self.width,self.height,2,borders)
+	end
+}
+
+seed_text = seed_field:attach_text_editor{
+	x=3,y=1,width_rel = 0.9,height=11,
+	max_lines=1,fgcol = font, bgcol = fieldlight,curcol = fielddark,selcol=fielddark,
+	margin_top = 2, margin_left = 0,
+	block_scrolling = true,
+	
+	text_callback = function(self, txt)
+		if (tonum(txt)) return true -- let number pass through
+		-- otherwise, discard the textinput
+	end
+}
+
+
+
+--Resolution------------------------------------------------
+
+resolution_label = tool_pane:attach{
+	x=margins*3,y=22,width = 55,height = 11,
+	draw = function(self) print("Size:",margins,3,font) end
+}
+
+resolution_field = tool_pane:attach{
+	x=-margins*3,y=22,width_rel = 0.6,height = 13,
+	justify = "right",
+	draw = function(self)
+		rrectfill(0,0,self.width,self.height,2,fieldlight)
+		rrect(0,0,self.width,self.height,2,borders)
+	end
+}
+
+resolution_value = resolution_field:attach{
+	x=0,y=0,width=30,height=12,justify = "center",
+	draw = function(self)
+		local s = string.format("%ix%i",resolution,resolution)
+		self.width = #s * 5
+		print(s,0,3,font)
+	end
+}
+
+resolution_minus = resolution_field:attach_button{
+	x=0,y=0,width=13,height = 14,
+	justify = "left",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "-",
+	
+	tap = function(self) if(resolution>8) resolution >>= 1 end
+}
+
+resolution_plus = resolution_field:attach_button{
+	x=0,y=0,width=13,height = 14,
+	justify = "right",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "+",
+	tap = function(self) if(resolution<512) resolution <<= 1 end
+}
+
+
+
+--Grid Size----------------------------------------------------------
+
+grid_label = tool_pane:attach{
+	x=margins*3,y=38,width = 55,height = 11,
+	draw = function(self) print("Grid:",margins,3,font) end
+}
+
+grid_field = tool_pane:attach{
+	x=-margins*3,y=38,width_rel = 0.6,height = 13,
+	justify = "right",
+	draw = function(self)
+		rrectfill(0,0,self.width,self.height,2,fieldlight)
+		rrect(0,0,self.width,self.height,2,borders)
+	end
+}
+
+grid_value = grid_field:attach{
+	x=0,y=0,width=30,height=12,justify = "center",
+	draw = function(self)
+		local s = string.format("%ix%i",gridsize,gridsize)
+		self.width = #s * 5
+		print(s,0,3,font)
+	end
+}
+
+grid_minus = grid_field:attach_button{
+	x=0,y=0,width=13,height = 14,
+	justify = "left",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "-",
+	
+	tap = function(self) if(gridsize>2) gridsize >>= 1 end
+}
+
+grid_plus = grid_field:attach_button{
+	x=0,y=0,width=13,height = 14,
+	justify = "right",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "+",
+	tap = function(self) if(gridsize<resolution) gridsize <<= 1 end
+}
+
+
+
+--Octaves---------------------------------------------------------
+
+octaves_label = tool_pane:attach{
+	x=margins*3,y=54,width = 55,height = 11,
+	draw = function(self) print("Octaves:",margins,3,font) end
+}
+
+octaves_field = tool_pane:attach{
+	x=-margins*3,y=54,width_rel = 0.35,height = 13,
+	justify = "right",
+	draw = function(self)
+		rrectfill(0,0,self.width,self.height,2,fieldlight)
+		rrect(0,0,self.width,self.height,2,borders)
+	end
+}
+
+octaves_value = octaves_field:attach{
+	x=0,y=0,width=30,height=12,justify = "center",
+	draw = function(self)
+		local s = string.format("%i",octaves)
+		self.width = #s * 5
+		print(s,0,3,font)
+	end
+}
+
+octaves_minus = octaves_field:attach_button{
+	x=0,y=0,width=13,height = 14,
+	justify = "left",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "-",
+	
+	tap = function(self) if(octaves>1) octaves -= 1 end
+}
+
+octaves_plus = octaves_field:attach_button{
+	x=0,y=0,width=13,height = 14,
+	justify = "right",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "+",
+	tap = function(self) if(octaves<8) octaves += 1 end
+}
+
+
+
+--Roughness---------------------------------------------------------
+
+roughness_label = tool_pane:attach{
+	x=margins*3,y=70,width = 55,height = 11,
+	draw = function(self) print("Rough:",margins,3,font) end
+}
+
+roughness_field = tool_pane:attach{
+	x=-margins*3,y=70,width_rel = 0.6,height = 13,
+	justify = "right",
+	draw = function(self)
+		rrectfill(0,0,self.width,self.height,2,fieldlight)
+		rrect(0,0,self.width,self.height,2,borders)
+	end
+}
+
+roughness_value = roughness_field:attach{
+	x=0,y=0,width=30,height=12,justify = "center",
+	draw = function(self)
+		local s = string.format("%0.2f",roughness)
+		self.width = #s * 5
+		print(s,0,3,font)
+	end
+}
+
+roughness_minus = roughness_field:attach_button{
+	x=13,y=0,width=13,height = 14,
+	justify = "left",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "-",
+	
+	tap = function(self) if(roughness>=0.01) roughness -= 0.01 end
+}
+roughness_minusminus = roughness_field:attach_button{
+	x=0,y=0,width=14,height = 14,
+	justify = "left",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "--",
+	
+	tap = function(self) if(roughness>=0.1) roughness -= 0.1 end
+}
+
+roughness_plus = roughness_field:attach_button{
+	x=-13,y=0,width=13,height = 14,
+	justify = "right",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "+",
+	tap = function(self) if(roughness<=0.99) roughness += 0.01 end
+}
+roughness_plusplus = roughness_field:attach_button{
+	x=0,y=0,width=14,height = 14,
+	justify = "right",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "++",
+	tap = function(self) if(roughness<=0.9) roughness += 0.1 end
+}
+
+
+
+--Octaves---------------------------------------------------------
+
+lacunarity_label = tool_pane:attach{
+	x=margins*3,y=86,width = 55,height = 11,
+	draw = function(self) print("Lacunarity:",margins,3,font) end
+}
+
+lacunarity_field = tool_pane:attach{
+	x=-margins*3,y=86,width_rel = 0.35,height = 13,
+	justify = "right",
+	draw = function(self)
+		rrectfill(0,0,self.width,self.height,2,fieldlight)
+		rrect(0,0,self.width,self.height,2,borders)
+	end
+}
+
+lacunarity_value = lacunarity_field:attach{
+	x=0,y=0,width=30,height=12,justify = "center",
+	draw = function(self)
+		local s = string.format("%.1f",lacunarity)
+		self.width = #s * 5
+		print(s,0,3,font)
+	end
+}
+
+lacunarity_minus = lacunarity_field:attach_button{
+	x=0,y=0,width=13,height = 14,
+	justify = "left",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "-",
+	
+	tap = function(self) if(lacunarity>1) lacunarity -= 0.1 end
+}
+
+lacunarity_plus = lacunarity_field:attach_button{
+	x=0,y=0,width=13,height = 14,
+	justify = "right",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "+",
+	tap = function(self) if(lacunarity<4) lacunarity += 0.1 end
+}
+
+
+
+--Format-------------------------------------------------------------
+
+format_label = tool_pane:attach{
+	x=margins*3,y=-28,width = 55,height = 11,vjustify = "bottom",
+	draw = function(self) print("Format:",margins,3,font) end
+}
+
+format_button = tool_pane:attach_button{
+	x=-margins*3,y=-25,width_rel = 0.6,height = 13,
+	justify = "right",vjustify="bottom",
+	fgcol = buttoncolorsalt.fg,
+	bgcol = buttoncolorsalt.bg,
+	border = buttoncolorsalt.border,
+	update = function(self) 
+		if format == "i8" then self.label = " 8-bit int"
+		elseif format == "i16" then self.label = "16-bit int"
+		elseif format == "i32" then self.label = "32-bit int"
+		else self.label = "64-bit float" end
+	end,
+	
+	tap = function(self) 
+				format_menu = tool_pane:attach_pulldown{
+					x=self.x,y=self.y,width_rel = self.width_rel,
+					justify="right",vjustify="bottom",
+				}
+				format_menu:attach_pulldown_item{label = " 8-bit int",action=function(self) format = "i8"end}
+				format_menu:attach_pulldown_item{label = "16-bit int",action=function(self) format = "i16"end}
+				format_menu:attach_pulldown_item{label = "32-bit int",action=function(self) format = "i32"end}
+				format_menu:attach_pulldown_item{label = "64-bit float",action=function(self) format = "f64"end}
+			end
+}
+
+
+
+--Buttons------------------------------------------------------------
+
+save_btn = tool_pane:attach_button{
+	x = -6, y = -6, width_rel = 0.45,
+	justify = "right",vjustify= "bottom",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "Save as",
+	
+	tap = function(self)
+		Save()
+	end
+}
+
+generate_btn = tool_pane:attach_button{
+	x = 6, y = -6, width_rel = 0.45,
+	justify = "left",vjustify= "bottom",
+	fgcol = buttoncolors.fg,
+	bgcol = buttoncolors.bg,
+	border = buttoncolors.border,
+	label = "Generate",
+	
+	tap = function(self)
+		Generate()
+	end
+}
+
+
+
+
+
+legend = preview_pane:attach{
+	x=0,y=0,
+	width=11,height=128,
+	vjustify = "center",
+	draw = function(self)
+		sspr(gradient,0,0,1,shades,0,0,self.width,self.height)
+		print("1",3,1,0)
+		print("-1",1,self.height-8,shades)
+	end
+}
+
+preview = preview_pane:attach{
+	x=0,y=0,
+	width=130,height=130,
+	justify = "center", vjustify = "center",
+	squash_to_parent = true,
+	draw = function(self)
+		sspr(0,0,0,nil,nil,1,1,self.width-2,self.height-2)
+		rrect(0,0,self.width,self.height,2,borders)
+	end
+}
+
+info = ""
+info_label = preview_pane:attach{
+	x=-1, y=-3,
+	width = #info*5, height = 12,
+	justify = "right", vjustify = "bottom",
+	draw = function(self)
+		self.width = #info*5+1
+		print(outlineb .. info,1,2,fontlight)
+	end
+}
+
+perf_label = preview_pane:attach{
+	x=1, y=-3,
+	width = 96, height = 24,
+	justify = "left", vjustify = "bottom",
+	draw = function(self)
+		print(outlineb .. string.format("%.3fkB in RAM\n%.3fkB as POD",ram_size,file_size),1,2,fontlight)
+	end
+}
+
+preview_button = preview_pane:attach_button{
+	x = 0, y = 6,
+	justify = "center",vjustify= "top",
+	fgcol = buttoncolorsalt.fg,
+	bgcol = buttoncolorsalt.bg,
+	border = buttoncolorsalt.border,
+	label = "High Bitdepth Preview",
+	
+	tap = function(self)
+		TogglePalette()
+	end
+}
+
+
+:: .info.pod
+--[[pod,created="2026-01-15 17:19:56",modified="2026-02-07 10:43:27",runtime=24,workspaces={{location="main.lua#123",workspace_index=1},{location="ui.lua#338",workspace_index=1},{location="perlin.lua#32",workspace_index=1},{location="process.lua#34",workspace_index=1},{location="gfx/0.gfx#1",workspace_index=2}}]]
+:: gfx/.info.pod
+--[[pod,created="2026-01-15 17:19:56",modified="2026-02-07 10:43:27"]]
+:: gfx/0.gfx
+b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTAxLTE3IDEwOjM1OjQ4Iixtb2RpZmllZD0iMjAyNi0w
+Mi0wNyAxMDo0MzoyNyIscmV2aXNpb249Nl1dbHo0AH4AAAASMQAA8yF7WzBdPXtibXA9cHh1AEMg
+EBAE8FYHEAfAF9AXwAcQB-BWLGZsYWdzPTAscGFuX3gIAMt5PTAsem9vbT04fSw_AB-wMQD-----
+-----------------------------------------------------------XUG09OH19
+:: map/.info.pod
+--[[pod,created="2026-01-15 17:19:56",modified="2026-02-07 10:43:27"]]
+:: map/0.map
+b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTAxLTE3IDEwOjM1OjQ4Iixtb2RpZmllZD0iMjAyNS0w
+MS0xNyAxMDozNzo0NCIscmV2aXNpb249MV1dbHo0AFQAAABEEAAA8Ah7e2JtcD11c2VyZGF0YSgi
+aTE2IiwzMgMALyIwAQD--------------------7oSIpLHBhbl94PTAIANJ5PTAsdGlsZV9oPTE2
+CgBgdz0xNn19
+:: sfx/.info.pod
+--[[pod,created="2026-01-15 17:19:56",modified="2026-02-07 10:43:27"]]
+:: sfx/0.sfx
+b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTA3LTMxIDA4OjMwOjI4Iixtb2RpZmllZD0iMjAyNS0w
+Ny0zMSAwODozMDoyOCIscmV2aXNpb249MF1dbHo0AKAAAAALCgAA-zBweHUAAygAAAQABA9AEAIO
+AAGgASACoA4ADxAADfDKAQIDQA8PkAQFBgdADJAICQoLQAyQDwwPDQ8ODEAM8P8BAOv-J6oBEAYP
+MBABIAEgAfAAAhACDhABIA8hIAEwD0Dwww8oD--wxg-4Cg--D4AP9w8NAfAJARAGDjAA------_9
+H-8BAKzPyA9AAA8QQP--sPD-AQD-6lD-----KQ==
+:: [eoc]
